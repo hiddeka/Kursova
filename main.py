@@ -7,32 +7,25 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 import os
 import io
+import traceback
+import hashlib
+import re
 from contextlib import redirect_stderr
 from dotenv import load_dotenv, find_dotenv
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.exceptions import SpotifyException
 
-try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-    from spotipy.exceptions import SpotifyException
 
-    dotenv_path = find_dotenv('.env', raise_error_if_not_found=False)
-    if dotenv_path:
-        load_dotenv(dotenv_path)
-    else:
-        load_dotenv()
+load_dotenv()
 
-    client_id = os.getenv("SPOTIPY_CLIENT_ID")
-    client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
-    if client_id and client_secret:
-        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-            client_id=client_id,
-            client_secret=client_secret
-        ))
-    else:
-        sp = None
-except Exception:
-    sp = None
+client_id = os.getenv("SPOTIPY_CLIENT_ID")
+client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
 
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+    client_id=client_id,
+    client_secret=client_secret
+))
 
 number_cols = [
     'valence', 'year', 'acousticness', 'danceability', 'duration_ms', 'energy', 'explicit',
@@ -62,8 +55,126 @@ def load_user_history(path: str = "user_favorites.csv") -> pd.DataFrame:
     return history
 
 
+def load_users(path: str = "users.csv") -> pd.DataFrame:
+    users = pd.read_csv(path)
+    users["user_id"] = pd.to_numeric(users["user_id"], errors="coerce").fillna(0).astype(int)
+    users["name"] = users["name"].astype(str)
+    if "password_hash" not in users.columns:
+        users["password_hash"] = ""
+    users["password_hash"] = users["password_hash"].fillna("").astype(str)
+    return users
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
+
+
+def register_user(name: str, password: str, path: str = "users.csv") -> Dict:
+    name = str(name).strip()
+    password = str(password)
+    if not name or not password:
+        return {"ok": False, "message": "Введіть ім'я користувача і пароль."}
+
+    users = load_users(path)
+    if users["name"].str.strip().str.lower().eq(name.lower()).any():
+        return {"ok": False, "message": "Користувач з таким ім'ям вже існує."}
+
+    next_id = int(users["user_id"].max()) + 1 if not users.empty else 1
+    new_user = pd.DataFrame([{
+        "user_id": next_id,
+        "name": name,
+        "password_hash": hash_password(password),
+    }])
+    users = pd.concat([users, new_user], ignore_index=True)
+    users[["user_id", "name", "password_hash"]].to_csv(path, index=False)
+    load_data.cache_clear()
+    load_user_history.cache_clear()
+    return {"ok": True, "message": "Користувача зареєстровано.", "user_id": next_id, "name": name}
+
+
+def authenticate_user(name: str, password: str, path: str = "users.csv") -> Optional[Dict]:
+    users = load_users(path)
+    name_key = str(name).strip().lower()
+    matched = users[users["name"].str.strip().str.lower() == name_key]
+    if matched.empty:
+        return None
+
+    user = matched.iloc[0]
+    stored_hash = str(user.get("password_hash", ""))
+    if stored_hash and stored_hash != hash_password(password):
+        return None
+    if not stored_hash and password:
+        return None
+
+    return {"user_id": int(user["user_id"]), "name": user["name"]}
+
+
+def save_user_rating(
+    user_id: int,
+    track: Dict,
+    rating: float,
+    path: str = "user_favorites.csv"
+) -> Dict:
+    rating = float(rating)
+    rating = min(max(rating, 1.0), 5.0)
+
+    history = load_user_history(path)
+    name = str(track.get("name", "")).strip()
+    artist = str(track.get("artist") or track.get("artists", "")).strip()
+    year = int(track.get("year", 0) or 0)
+    if not name:
+        return {"ok": False, "message": "Немає назви треку для оцінки."}
+
+    mask = (
+        (history["user_id"] == int(user_id))
+        & (history["name"].str.strip().str.lower() == name.lower())
+        & (history["artist"].str.strip().str.lower() == artist.lower())
+        & (history["year"] == year)
+    )
+
+    if mask.any():
+        history.loc[mask, "rating"] = rating
+    else:
+        history = pd.concat([history, pd.DataFrame([{
+            "user_id": int(user_id),
+            "name": name,
+            "artist": artist,
+            "year": year,
+            "rating": rating,
+        }])], ignore_index=True)
+
+    history[["user_id", "name", "artist", "year", "rating"]].to_csv(path, index=False)
+    load_user_history.cache_clear()
+    return {"ok": True, "message": "Оцінку збережено."}
+
+
+def get_user_ratings(user_id: int, path: str = "user_favorites.csv") -> pd.DataFrame:
+    history = load_user_history(path)
+    return history[history["user_id"] == int(user_id)].copy()
+
+
 def build_item_key(name: str, artist: str, year: int) -> str:
     return f"{str(name).strip().lower()}|{str(artist).strip().lower()}|{int(year)}"
+
+
+def normalize_track_name(name: str) -> str:
+    return re.sub(r"[^a-zа-яіїєґ0-9]+", "", str(name).strip().lower())
+
+
+def filter_rated_tracks(recommendations: List[Dict], rated_tracks: List[Dict]) -> List[Dict]:
+    rated_names = {
+        normalize_track_name(track.get("name", ""))
+        for track in rated_tracks
+        if normalize_track_name(track.get("name", ""))
+    }
+    if not rated_names:
+        return recommendations
+
+    filtered = []
+    for recommendation in recommendations:
+        if normalize_track_name(recommendation.get("name", "")) not in rated_names:
+            filtered.append(recommendation)
+    return filtered
 
 
 def ensure_search_columns(data: pd.DataFrame) -> pd.DataFrame:
@@ -191,43 +302,48 @@ def recommend_for_user(
     return user_user_cf_recommendations(user_id, user_history, data, n_songs)
 
 
-def find_song(name: str, year: int) -> Optional[pd.DataFrame]:
+def find_song(name: str, year: int, artist: Optional[str] = None) -> Optional[pd.DataFrame]:
     if sp is None:
         return None
-    
+
     try:
-        results = sp.search(q=f"track:{name} year:{year}", limit=1)
+        query_parts = [f"track:{name}"]
+        if artist:
+            query_parts.append(f"artist:{artist}")
+        if year and year > 0:
+            query_parts.append(f"year:{year}")
+
+        results = sp.search(q=" ".join(query_parts), type="track", limit=1)
         if not results['tracks']['items']:
+            print(f"Spotify track not found for {name} ({year})")
             return None
 
         track = results['tracks']['items'][0]
         track_id = track['id']
-        try:
-            with redirect_stderr(io.StringIO()):
-                audio_features = sp.audio_features([track_id])[0]
-        except Exception:
-            audio_features = None
-
-        song_data = {
-            "name": [name],
-            "year": [year],
-            "explicit": [int(track['explicit'])],
-            "duration_ms": [track['duration_ms']],
-            "popularity": [track['popularity']]
-        }
-
-        if audio_features is not None:
-            for key, value in audio_features.items():
-                if value is not None:
-                    song_data[key] = [value]
-
-        return pd.DataFrame(song_data)
-    except SpotifyException as e:
-        print(f"Spotify error for {name} ({year}): {e}")
+        with redirect_stderr(io.StringIO()):
+            audio_features = sp.audio_features([track_id])[0]
+    except SpotifyException:
+        traceback.print_exc()
         return None
-    except Exception as e:
-        print(f"Error finding song {name} ({year}): {e}")
+    except Exception:
+        traceback.print_exc()
         return None
+
+    song_data = {
+        "name": [track.get('name', name)],
+        "artists": [', '.join(artist.get('name', '') for artist in track.get('artists', []))],
+        "year": [parse_release_year(track.get('album', {}).get('release_date', '')) or year],
+        "explicit": [int(track['explicit'])],
+        "duration_ms": [track['duration_ms']],
+        "popularity": [track['popularity']]
+    }
+
+    if audio_features is not None:
+        for key, value in audio_features.items():
+            if value is not None:
+                song_data[key] = [value]
+
+    return pd.DataFrame(song_data)
 
 
 def parse_release_year(release_date: str) -> int:
@@ -235,6 +351,68 @@ def parse_release_year(release_date: str) -> int:
         return int(str(release_date)[:4])
     except Exception:
         return 0
+
+
+def search_tracks(query: str, data: pd.DataFrame, limit: int = 10) -> List[Dict]:
+    query = str(query).strip()
+    if not query:
+        return []
+
+    results = []
+    seen = set()
+
+    if sp is not None:
+        try:
+            spotify_results = sp.search(q=query, type="track", limit=limit)
+            for track in spotify_results.get("tracks", {}).get("items", []):
+                artists = ", ".join(
+                    artist.get("name", "")
+                    for artist in track.get("artists", [])
+                    if artist.get("name")
+                )
+                row = {
+                    "name": track.get("name", ""),
+                    "artist": artists,
+                    "year": parse_release_year(track.get("album", {}).get("release_date", "")),
+                    "popularity": int(track.get("popularity", 0)),
+                    "source": "Spotify",
+                }
+                key = build_item_key(row["name"], row["artist"], row["year"])
+                if row["name"] and key not in seen:
+                    seen.add(key)
+                    results.append(row)
+        except SpotifyException:
+            traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+
+    if results:
+        return results[:limit]
+
+    data = ensure_search_columns(data)
+    key = query.lower()
+    matched = data[
+        data["_name_norm"].str.contains(key, regex=False, na=False)
+        | data["_artists_norm"].str.contains(key, regex=False, na=False)
+    ]
+    if "popularity" in matched.columns:
+        matched = matched.sort_values("popularity", ascending=False)
+
+    for _, row in matched.head(limit).iterrows():
+        artists = str(row.get("artists", ""))
+        result = {
+            "name": str(row.get("name", "")),
+            "artist": artists,
+            "year": int(row.get("year", 0)),
+            "popularity": int(row.get("popularity", 0)),
+            "source": "data.csv",
+        }
+        result_key = build_item_key(result["name"], result["artist"], result["year"])
+        if result["name"] and result_key not in seen:
+            seen.add(result_key)
+            results.append(result)
+
+    return results[:limit]
 
 
 def get_spotify_track_id(name: str, year: int) -> Optional[str]:
@@ -351,28 +529,42 @@ def get_spotify_candidate_pool(song_list: List[Dict], spotify_data: pd.DataFrame
             try:
                 with redirect_stderr(io.StringIO()):
                     audio_features = sp.audio_features([track_id])[0]
+            except SpotifyException:
+                traceback.print_exc()
+                audio_features = None
             except Exception:
+                traceback.print_exc()
                 audio_features = None
             rows.append(build_spotify_candidate_row(track, audio_features or {}))
         except Exception:
             return
 
     for song in song_list:
-        if song.get('artist'):
-            artist_search = sp.search(q=f"artist:{song['artist']}", type='track', limit=10)
-            for track in artist_search.get('tracks', {}).get('items', []):
-                add_track(track)
+        try:
+            if song.get('artist'):
+                artist_search = sp.search(q=f"artist:{song['artist']}", type='track', limit=10)
+                for track in artist_search.get('tracks', {}).get('items', []):
+                    add_track(track)
+                    if len(rows) >= max_tracks:
+                        break
                 if len(rows) >= max_tracks:
                     break
-            if len(rows) >= max_tracks:
-                break
 
-        if song.get('name'):
-            search_results = sp.search(q=f"track:{song['name']} year:{song.get('year', -1)}", type='track', limit=10)
-            for track in search_results.get('tracks', {}).get('items', []):
-                add_track(track)
-                if len(rows) >= max_tracks:
-                    break
+            if song.get('name'):
+                query_parts = [f"track:{song['name']}"]
+                if song.get('artist'):
+                    query_parts.append(f"artist:{song['artist']}")
+                if song.get('year') and song.get('year', -1) > 0:
+                    query_parts.append(f"year:{song['year']}")
+                search_results = sp.search(q=" ".join(query_parts), type='track', limit=10)
+                for track in search_results.get('tracks', {}).get('items', []):
+                    add_track(track)
+                    if len(rows) >= max_tracks:
+                        break
+        except SpotifyException:
+            traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
         if len(rows) >= max_tracks:
             break
 
@@ -386,23 +578,30 @@ def get_mean_vector(song_list: List[Dict], spotify_data: pd.DataFrame) -> Option
     song_vectors = []
     
     for song in song_list:
-        row = find_song_in_data(song.get('name', ''), song.get('year', -1), spotify_data)
-        if row is not None:
-            vector = row[number_cols].astype(float).values
-            song_vectors.append(vector)
-            continue
-
-        external = find_song(song.get('name', ''), song.get('year', -1))
+        external = find_song(
+            song.get('name', ''),
+            song.get('year', -1),
+            song.get('artist')
+        )
         if external is not None:
             try:
                 vector = external[number_cols].values[0]
                 song_vectors.append(vector)
+                continue
             except (KeyError, IndexError):
+                external = None
                 print(f"Warning: {song.get('name', 'Unknown')} - не всі параметри доступні")
-        else:
+        if external is None:
           
             if song.get('name'):
-                row = find_song_in_data(song.get('name', ''), -1, spotify_data)
+                row = find_song_in_data(
+                    song.get('name', ''),
+                    song.get('year', -1),
+                    spotify_data,
+                    song.get('artist')
+                )
+                if row is None:
+                    row = find_song_in_data(song.get('name', ''), -1, spotify_data, song.get('artist'))
                 if row is not None:
                     vector = row[number_cols].astype(float).values
                     song_vectors.append(vector)
@@ -437,8 +636,7 @@ def hybrid_recommendations(
     spotify_candidates = get_spotify_candidate_pool(song_list, spotify_data, max_tracks=120)
     candidate_data = spotify_data
     if not spotify_candidates.empty:
-        candidate_data = pd.concat([spotify_data, spotify_candidates], ignore_index=True)
-        candidate_data = candidate_data.drop_duplicates(subset=['name', 'artists', 'year']).reset_index(drop=True)
+        candidate_data = spotify_candidates.drop_duplicates(subset=['name', 'artists', 'year']).reset_index(drop=True)
 
     scaled_features = scaler.fit_transform(candidate_data[number_cols].fillna(0).values)
     scaled_center = scaler.transform(song_center.reshape(1, -1))
@@ -457,10 +655,16 @@ def hybrid_recommendations(
 
     final_scores = (alpha * content_sim + beta * collab_scores + gamma * pop_scores)
 
+    rated_names = {
+        normalize_track_name(song.get('name', ''))
+        for song in song_list
+        if normalize_track_name(song.get('name', ''))
+    }
+
     input_mask = np.zeros(len(candidate_data), dtype=bool)
     for song in song_list:
-        mask = (candidate_data['name'].str.strip().str.lower() == str(song.get('name', '')).strip().lower()) & \
-               (candidate_data['year'] == song.get('year', -1))
+        song_name = normalize_track_name(song.get('name', ''))
+        mask = candidate_data['name'].apply(normalize_track_name) == song_name
         input_mask |= mask.values
 
     final_scores[input_mask] = -9999
@@ -478,8 +682,10 @@ def hybrid_recommendations(
         if count >= n_songs:
             break
         track = candidate_data.iloc[idx]
-        name_lower = str(track['name']).strip().lower()
-        if name_lower not in seen:
+        name_key = normalize_track_name(track['name'])
+        if name_key in rated_names or final_scores[idx] <= -9999:
+            continue
+        if name_key not in seen:
             rec_list.append({
                 'name': track['name'],
                 'artists': track['artists'],
@@ -488,7 +694,7 @@ def hybrid_recommendations(
                 'hybrid_score': round(final_scores[idx], 4),
                 'content_similarity': round(content_sim[idx], 4)
             })
-            seen.add(name_lower)
+            seen.add(name_key)
             count += 1
     return rec_list
 
@@ -497,17 +703,27 @@ def recommend_songs(
     song_list: List[Dict],
     strategy: str,
     data: pd.DataFrame,
-    n_songs: int = 10,
+    n_songs: int = 30,
     user_id: Optional[int] = None,
     user_history: Optional[pd.DataFrame] = None,
 ) -> List[Dict]:
-    if user_id is not None and user_history is not None:
+    recommendations = []
+
+    if strategy == "User-based CF" and user_id is not None and user_history is not None:
         user_recs = recommend_for_user(user_id, data, user_history, n_songs=n_songs)
         if user_recs:
-            return user_recs
+            recommendations = user_recs
 
-    if strategy == "Контент тільки":
-        return hybrid_recommendations(song_list, data, n_songs=n_songs, alpha=1.0, beta=0.0, gamma=0.0)
-    if strategy == "Популярні треки":
-        return hybrid_recommendations(song_list, data, n_songs=n_songs, alpha=0.0, beta=1.0, gamma=0.0)
-    return hybrid_recommendations(song_list, data, n_songs=n_songs)
+    if not recommendations:
+        if strategy == "Контент тільки":
+            recommendations = hybrid_recommendations(
+                song_list, data, n_songs=n_songs, alpha=1.0, beta=0.0, gamma=0.0
+            )
+        elif strategy == "Популярні треки":
+            recommendations = hybrid_recommendations(
+                song_list, data, n_songs=n_songs, alpha=0.0, beta=1.0, gamma=0.0
+            )
+        else:
+            recommendations = hybrid_recommendations(song_list, data, n_songs=n_songs)
+
+    return filter_rated_tracks(recommendations, song_list)[:n_songs]
